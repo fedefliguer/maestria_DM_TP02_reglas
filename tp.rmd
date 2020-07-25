@@ -1,0 +1,434 @@
+library(tokenizers)
+library(tidytext)
+library(dplyr)
+library(lubridate)
+library(mongolite)
+library(ggplot2)
+library(tidyr)
+library(tm)
+library(stringr)
+library(stringi)
+library(arules)
+
+# DESCARGA
+df_tweets = readRDS("tweets.RDS")
+df_users = readRDS("users.RDS")
+
+tweets = tweets %>% select(
+  user_id,
+  status_id,
+  created_at,
+  text,
+  is_retweet,
+  favorite_count,
+  retweet_count,
+  hashtags,
+  symbols,
+  urls_url,
+  media_type,
+  mentions_user_id,
+  text,
+  hashtags
+)
+
+users = df_users %>% select(
+  user_id,
+  location,
+  followers_count,
+  statuses_count,
+  account_created_at,
+  verified
+)
+
+# Automáticamente asociadas al twitt:
+
+#Día de la semana de publicación.
+tweets$fc_publicacion = as.Date(tweets$created_at)
+tweets$ch_date <- weekdays(tweets$fc_publicacion)
+
+#Hora de publicación. 
+tweets$hh_hora <- format(as.POSIXct(strptime(tweets$created_at,"%Y-%m-%d %H:%M:%S",tz="")) ,format = "%H")
+
+table(tweets$hh_hora)
+
+#Función auxiliar para las que siguen
+qgroup = function(numvec, n = 5){
+  qtile = quantile(numvec, probs = seq(0, 1, 1/n))
+  quintil = sapply(numvec, function(x) sum(x >= qtile[-(n+1)]))
+  out = case_when(quintil == 1 ~ "Muy bajo",
+                  quintil == 2 ~ "Bajo",
+                  quintil == 3 ~ "Medio",
+                  quintil == 4 ~ "Alto",
+                  quintil == 5 ~ "Muy alto",
+  )
+  return(out)
+}
+
+#Cantidad de caracteres. Aplicar discretización.
+tweets$nu_caracteres = nchar(tweets$text)
+tweets$gr_nu_caracteres = qgroup(tweets$nu_caracteres)
+
+
+#Cantidad de palabras. Aplicar discretización.
+tweets$nu_palabras = sapply(strsplit(tweets$text, " "), length)
+tweets$gr_nu_palabras = qgroup(tweets$nu_palabras)
+
+#Cantidad de hashtags que contiene.
+tweets$nu_hashtags = ifelse(tweets$hashtags == "NA"
+                            ,0
+                            ,stri_count(str = as.character(tweets$hashtags), regex=",") + 1)
+tweets$gr_nu_hashtags = case_when(tweets$nu_hashtags == 0 ~ "Ninguno",
+                                  tweets$nu_hashtags == 1 ~ "Uno",
+                                  tweets$nu_hashtags == 2 ~ "Dos",
+                                  tweets$nu_hashtags == 3 ~ "Tres",
+                                  tweets$nu_hashtags == 4 ~ "Cuatro",
+                                  tweets$nu_hashtags == 5 ~ "Cinco",
+                                  tweets$nu_hashtags > 5 ~ "Más de cinco")
+
+#Cantidad de usuarios que menciona.
+tweets$nu_mentions = ifelse(tweets$mentions_user_id == "NA"
+                            ,0
+                            ,stri_count(str = as.character(tweets$mentions_user_id), regex=",") + 1)
+tweets$gr_nu_mentions = case_when(tweets$nu_mentions == 0 ~ "Ninguno",
+                                  tweets$nu_mentions == 1 ~ "Uno",
+                                  tweets$nu_mentions == 2 ~ "Dos",
+                                  tweets$nu_mentions == 3 ~ "Tres",
+                                  tweets$nu_mentions == 4 ~ "Cuatro",
+                                  tweets$nu_mentions == 5 ~ "Cinco",
+                                  tweets$nu_mentions > 5 ~ "Más de cinco")
+
+
+# Relativas al usuario
+
+users$location <- gsub("@\\w+", "", users$location)
+users$location <- gsub("[[:punct:]]", " ", users$location)
+users$location <- gsub("http\\w+", "", users$location)
+users$location <- gsub("^ ", "", users$location)
+users$location <- gsub(" $", "", users$location)
+users$location <- gsub("[\r\n]", "", users$location)
+users$location <- tolower(users$location)
+users$location <- iconv(users$location,from="UTF-8",to="ASCII//TRANSLIT")
+
+users = users %>% mutate(
+  pais = case_when(grepl("sinaloa|mexico", location) ~ "mexico"
+                   ,grepl("cataluna|madrid|barcelona|valencia|spain|andalucia|sevilla|zaragoza", location) ~ "espana"
+                   ,grepl("pamplona|compostela|murcia|cadiz|galicia|bilbao|valladolid|alicante|TOLEDO|GRANADA|mallorca|ARAGON|VILLARCAYO|andalucia|espana|sevilla|pais vasco|malaga|catalunya|barcelona|madrid|tenerife|compostela|santander|castilla|spain|asturia|CANARIA|SANTIAGO DE COMPOSTELA", location) ~ "espana"
+                   ,grepl("tijuana|zacatecas|hermosillo|yucatan|mejico|xalapa|chihuahua|cdmx|jalisco|veracruz|queretaro|distrito|juarez|sonora|puebla|merida|hidalgo|mex|michoacan|chiapas|cuautitlan|morelos", location) ~ "mexico"
+                   ,grepl("cancun|LEON FONSECA|nuevo leon|queretaro|monterrey|tamaulipas|veracruz|juarez|mexico|sonora|sinaloa|tabasco|mexicanos|miguel hidalgo|guanaju|gto|mx|TENOCHTITLAN|oaxaca|mex|san luis potosi|CUAUHTEMOC|SANTIAGO  NUEVO LEON|SANTIAGO  QUERETARO|MEXICANOS| DF", location) ~ "mexico"
+                   ,grepl("nicaragua", location) ~ "nicaragua"
+                   ,grepl("quito|guayaquil", location) ~ "ecuador"
+                   ,grepl("bogota|antioquia", location) ~ "colombia"
+                   ,grepl("bucaramanga|cucuta|cordoba sucre|VILLA CAROLA|cali|colombia|monteria cordoba|monteriacordoba|cordobasucre|medellin|barranquilla|VILLAVICENCIO META|VILLAVICENCIO  META|SANTIAGO DE CALI", location) ~ "colombia"
+                   ,grepl("paraguay|ciudad del este|asuncion", location) ~ "paraguay"
+                   ,grepl("limaperu|lima|arequipa", location) ~ "peru"
+                   ,grepl("caracas|maracaibo", location) ~ "venezuela"
+                   ,grepl("venezuela|bolivares|EDO VARGAS|SAN FELIX|EDO VARGAS|CABUDARE|CUMANA EDO SUCRE|CUMANA  ESTADO SUCRE|TURMERO|GUATIRE|BARQUISIMETO|GUARENAS|VALERA|PUNTO FIJO  ESTADO FALCON|APURE|MARGARITA|TACHIRA  SN CRISTOBAL|SAN CRISTOBAL  TACHIRA|SAN CRISTOBAL  EDO  TACHIRA |SAN CRISTOBAL ESTADO TACHIRA|TUCACAS|EDO SUCRE|EDO  SUCRE|VA ESPARTA|MARACAY  ARAGUA|VZLA|ANZOATEGUI  SUCRE  Y MONAGAS|CARUPANO  ESTADO SUCRE|MARACAIBO ESTADO ZULIA|MONAGAS|EDO VARGAS|ESTADO VARGAS|ESTADO FALCON|EDO FALCON|GUACARA", location) ~ "venezuela"
+                   ,grepl("dominican|rep dom|santo domingo|REP DOM|REPUBLICA DOMINICANA", location) ~ "republica dominicana"
+                   ,grepl("rica", location) ~ "costa rica"
+                   ,grepl("puerto", location) ~ "puerto rico"
+                   ,grepl("deutschland|berlin|germany", location) ~ "alemania"
+                   ,grepl("salvador", location) ~ "el salvador"
+                   ,grepl("guatemala", location) ~ "guatemala"
+                   ,grepl("emiratos arabes", location) ~ "emiratos arabes"
+                   ,grepl("habana", location) ~ "cuba"
+                   ,grepl("santiago de cuba", location) ~ "cuba"
+                   ,grepl("panama|santiago veraguas", location) ~ "panama"
+                   ,grepl("sydney", location) ~ "australia"
+                   ,grepl("kingdom|GRANTCHESTER MEADOWS", location) ~ "inglaterra"
+                   ,grepl("dublin|irlanda", location) ~ "irlanda"
+                   ,grepl("denmark", location) ~ "dinamarca"
+                   ,grepl("paris fran|paris china|MONTMARTRE", location) ~ "francia"
+                   ,grepl("Federal Capital Territory", location) ~ "nigeria"
+                   ,grepl("montevideo", location) ~ "uruguay"
+                   ,grepl("araucania|temuco|santiago|rancagua|serena", location) ~ "chile"
+                   ,grepl("valparaiso|antofagasta|iquique|VINA DEL MAR|VILLARRICA|chile|region de los rios", location) ~ "chile"
+                   ,grepl("rivadavia|tandil|pehuajo|ituzaingo|castelar|burzaco|aires|ushuaia|salta|pampa|buenos|rosario|chubut|mendoza|misiones|berazategui|catamarca|palomar|federal|palermo|cordoba|luis", location) ~ "argentina"
+                   ,grepl("buenos aires|SAN NICOLAS DE LOS ARROYOS|corrientes|lanus|temperley|avellaneda|BOEDO|CHACO|VILLA MERCEDES|VILLA MARIA|VILLA LUZURIAGA|VILLA LURO|VILLA LUGANO|VILLA LA ANGOSTURA|VILLA CRESPO|VILLA CARLOS PAZ|VILLA HUIDOBRO|VILLA BALLESTER|VILLA ORTUZAR|SAN MARTIN DE LOS ANDES|GRAND  BOURG|MONTE GRANDE|BAHIA BLANCA|ROSARIO|VILLA RUMIPAL|VILLA CONSTITUCION|VILLA DEL PARQUE|VILLA URQUIZA|baires|tierra del fuego|caba|argen|santa fe|bs as|bsas|evita|neuquen|la plata|mar del plata|tucuman|santiago del estero|ENTRE RIOS", location) ~ "argentina"
+                   ,grepl("texas|chicago|manhattan|alabama|MISSOURI|nueva york|new york|utah|united states|salt lake|ISLAS MARIANAS|brooklyn", location) ~ "usa"
+                   ,TRUE ~ 'Otros'))
+
+#Cantidad de seguidores
+users$gr_nu_seguidores = qgroup(users$followers_count)
+
+#Cantidad de statuses generados. Aplicar discretización.
+users$gr_nu_statuses = qgroup(users$statuses_count)
+
+#Cuentas verificadas.
+users$fl_verified = users$verified
+
+#Antigüedad de la cuenta
+users$antiguedad = Sys.Date()-as.Date(users$account_created_at)
+users$gr_antiguedad <- qgroup(users$antiguedad)
+
+df_basket_about = left_join(tweets, users, by='user_id')
+
+# EXCLUYO USUARIOS
+df_basket_about = df_basket_about %>% filter(
+  antiguedad > 15 &
+    is_retweet == FALSE
+)
+
+# TRATAMIENTO DEL TEXTO
+
+df_text = df_basket_about %>% select(c('status_id','text'))
+
+#Limpieza de textos
+
+#Se eliminan hashtags del texto para no repetirlos como ítem word y hashtag.
+df_text$text_2 = str_remove_all(df_text$text, "(#.*? )")
+#Se eliminan URL's.
+df_text$text_2 = gsub("http[[:alnum:][:punct:]]*"," ", df_text$text_2)
+#Se quitan caracteres no alfanuméricos
+df_text$text_2 <- gsub("[^[:alnum:][:blank:]?&/\\-]", " ", df_text$text_2)
+#Se eliminan emojis
+df_text$text_2 <- gsub("U00..", "", df_text$text_2)
+#Se quitan tildes
+df_text$text_2 = stri_trans_general(df_text$text_2, "Latin-ASCII")
+#Se pasa a minúsculas
+df_text$text_2 = tolower(df_text$text_2)
+#Se quita puntuación
+df_text$text_2 = removePunctuation(df_text$text_2)
+#Se quitan números
+df_text$text_2 = removeNumbers(df_text$text_2)
+#Se quitan stop words
+df_text$text_2 = removeWords(df_text$text_2, stopwords("spanish"))
+#Se quitan espacios extras
+df_text$text_2 =  stripWhitespace(df_text$text_2)
+#Se quitan espacios al principio y final de la cadena
+df_text$text_2 = str_trim(df_text$text_2)
+#Se quitan términos repetidos
+df_text$text_2 <- sapply(df_text$text_2, function(x) paste(unique(unlist(str_split(x," "))), collapse = " "))
+
+#Obtención de términos 
+df_text$words = tokenizers::tokenize_words(df_text$text_2, simplify = T)
+
+#Se pasa a formato pares: tweet-término
+df_text_unnest = df_text %>% select("status_id", "words")  %>% unnest(words) %>%  distinct()
+
+#Vemos palabras más frecuentes
+terminos_frecuencia = as.data.frame(table(df_text_unnest$words),stringsAsFactors = FALSE)
+colnames(terminos_frecuencia) = c("words","frecuencia")
+#Ordenamos por frecuencia descendente
+terminos_frecuencia = terminos_frecuencia[order(-terminos_frecuencia$frecuencia),]
+
+#Eliminamos términos no interesantes 
+terminos_frecuencia = terminos_frecuencia %>% filter(!(words %in% c('cuarentena',
+                                                                    'covid',
+                                                                    'coronavirus',
+                                                                    'mas',
+                                                                    'si',
+                                                                    'q'
+)))
+
+#Nos quedamos con los X términos más frecuentes
+terminos_frecuentes = head(terminos_frecuencia$words,1000) # Cambiar por la cant de palabras frecuentes que tomemos
+
+#Nos quedamos solo con las palabras más frecuentes
+df_carritos_WordsText = df_text_unnest %>% 
+  filter(words %in% terminos_frecuentes)
+
+# CONSTRUYO BASES
+
+df_carritos_WordsText$item = paste0("word=", df_carritos_WordsText$words)
+df_carritos_WordsText = df_carritos_WordsText %>% select ('status_id','item')
+
+df_carritos_WordsHashtags$item = paste0("hashtag=", df_carritos_WordsHashtags$word)
+df_carritos_WordsHashtags = df_carritos_WordsHashtags %>% select ('status_id','item')
+
+df_basket_about = left_join(df_basket_about, df_carritos_TopHashtags, by = 'status_id')
+df_basket_about = df_basket_about %>% mutate(use_popular_hashtags = case_when(
+  top == "isTop3" ~ "Top 3",
+  top == "isTop10" ~ "Top 10",
+  top == "isTop50" ~ "Top 50",
+  top == "noTop" & nu_hashtags>0 ~ "noTop"
+)) %>% select(status_id, hh_hora, gr_nu_hashtags, gr_nu_mentions, pais, gr_nu_seguidores, gr_nu_statuses, gr_antiguedad, use_popular_hashtags)
+
+df_carritos_about = cbind(df_basket_about[1], stack(df_basket_about[-1]))
+df_carritos_about$item = paste0(df_carritos_about$ind, "=", df_carritos_about$values)
+df_carritos_about = df_carritos_about %>% select ('status_id','item')
+
+df_carritos = rbind(df_carritos_about, df_carritos_WordsHashtags, df_carritos_WordsText)
+
+carritos = as.data.frame(apply(df_carritos, 2, as.factor))
+
+carritos = unique(carritos)
+
+# ELIMINAR ATRIBUTOS INNECESARIOS
+
+carritos = carritos %>% filter(item!="hashtag=NA",
+                               item!="use_popular_hashtags=NA",
+                               item!="pais=Otros",
+                               item!="use_popular_hashtags=Top 3",
+                               item!="use_popular_hashtags=Top 10",
+                               item!="use_popular_hashtags=Top 50",
+                               item!="top=noTop",
+                               item!="gr_nu_mentions=Ninguno",
+                               item!="gr_nu_hashtags=Ninguno"
+) 
+
+# CONSTRUIR VARIABLES NUEVAS
+
+agrupo_contenido_urgente = carritos %>% filter(item %in%
+                                                 c("hashtag=1jun", 
+                                                   "hashtag=1junio",
+                                                   "hashtag=28may",
+                                                   "hashtag=29demayo",
+                                                   "hashtag=29may",
+                                                   "hashtag=29mayo",
+                                                   "hashtag=30may",
+                                                   "hashtag=30mayo",
+                                                   "hashtag=31may",
+                                                   "hashtag=8jun",
+                                                   "hashtag=8m",
+                                                   "word=urgente",
+                                                   "word=atencion",
+                                                   "word=emergencia",
+                                                   "word=ultimas",
+                                                   "word=social",
+                                                   "word=noticia",
+                                                   "word=primero",
+                                                   "word=alerta",
+                                                   "word=confirma",
+                                                   "hashtag=ultimahora",
+                                                   "hashtag=entérate",
+                                                   "hashtag=urgente",
+                                                   "hashtag=atención"))
+agrupo_contenido_urgente$item = "contenido=Urgente"
+
+agrupo_contenido_social = carritos %>% filter(item %in%
+                                                c("word=gobierno",
+                                                  "word=presidente",
+                                                  "word=pueblo",
+                                                  "word=crisis",
+                                                  "word=economia",
+                                                  "word=poblacion",
+                                                  "word=trump",
+                                                  "word=pais",
+                                                  "word=espana",
+                                                  "word=mexico",
+                                                  "word=argentina",
+                                                  "word=chile",
+                                                  "word=colombia",
+                                                  "word=venezuela",
+                                                  "word=china",
+                                                  "word=ministro",
+                                                  "word=brasil",
+                                                  "word=peru",
+                                                  "word=madrid",
+                                                  "word=economica",
+                                                  "word=region",
+                                                  "word=ministerio",
+                                                  "word=cuba",
+                                                  "word=bogota",
+                                                  "word=mx",
+                                                  "word=ivanduque",
+                                                  "word=nicolasmaduro",
+                                                  "word=eeuu",
+                                                  "word=uruguay",
+                                                  "word=alferdez",
+                                                  "word=rusia",
+                                                  "word=rosario",
+                                                  "word=decreto",
+                                                  "word=alcalde",
+                                                  "word=italia",
+                                                  "word=gobernador",
+                                                  "word=internacional",
+                                                  "word=pobreza",
+                                                  "word=desempleo",
+                                                  "hashtag=cuba",
+                                                  "word=funcionarios",
+                                                  "word=publicos",
+                                                  "word=republica",
+                                                  "word=congreso",
+                                                  "word=ecuador",
+                                                  "hashtag=graciaspuebloheroico",
+                                                  "hashtag=internacional",
+                                                  "hashtag=argentina",
+                                                  "hashtag=colombia",
+                                                  "hashtag=yomequedoencasa",
+                                                  "hashtag=mundo",
+                                                  "hashtag=eeuu",
+                                                  "hashtag=cubaporlasalud"
+                                                ))
+agrupo_contenido_social$item = "contenido=Social"
+
+agrupo_contenido_negativo = carritos %>% filter(item %in%
+                                                  c("word=muertes",
+                                                    "word=muertos",
+                                                    "word=fallecidos",
+                                                    "word=mal",
+                                                    "word=peor",
+                                                    "word=mierda",
+                                                    "word=hambre",
+                                                    "word=miedo",
+                                                    "word=triste",
+                                                    "word=verguenza",
+                                                    "word=murio",
+                                                    "word=fallecimientos",
+                                                    "word=muere"
+                                                  ))
+agrupo_contenido_negativo$item = "contenido=Negativo"
+
+agrupo_contenido_positivo = carritos %>% filter(item %in%
+                                                  c("word=vida",
+                                                    "word=gracias",
+                                                    "word=bueno",
+                                                    "word=vacuna",
+                                                    "word=amigos",
+                                                    "hashtag=quedateencasa",
+                                                    "word=ojala",
+                                                    "word=quedateencasa",
+                                                    "word=feliz",
+                                                    "word=buenas",
+                                                    "word=juntos",
+                                                    "word=mejores",
+                                                    "word=cura",
+                                                    "word=paz"
+                                                  ))
+agrupo_contenido_positivo$item = "contenido=Positivo"
+
+carritos = rbind(carritos, agrupo_contenido_urgente, agrupo_contenido_social, agrupo_contenido_negativo, agrupo_contenido_positivo)
+
+# ÚNICAMENTE CONSERVAR ATRIBUTOS CON CIERTA FRECUENCIA
+
+frecuencias = data.frame(table(carritos$item)) %>% filter(Freq > 500) # O modificar
+numerosos = frecuencias$Var1
+carritos = carritos %>% filter(item %in% numerosos)
+
+# CONVIERTO A TRANSACCIÓN
+
+dir.create(path = "tmp", showWarnings = FALSE)
+write.csv(carritos, "./tmp/twitter_transactions.csv", row.names=FALSE)
+transacciones <- read.transactions(
+  file = "./tmp/twitter_transactions.csv",
+  format = "single",
+  sep = ",",
+  cols=c(1,2),
+  rm.duplicates = T
+)
+
+# ANALIZO
+
+#Punto A: Reglas interesantes
+soporte <- 100 / dim(transacciones)[1]
+rules <- apriori(data = transacciones,
+                 parameter = list(support = soporte,
+                                  minlen = 2,
+                                  maxlen = 20,
+                                  target = "rules"))
+
+#Punto B
+#Followers altos con statuses bajos
+b_rules <- arules::subset(rules, subset = items %in% c("gr_nu_seguidores=Alto", "gr_nu_seguidores=Muy alto"))
+b_rules <- arules::subset(b_rules, subset = items %in% c("gr_nu_statuses=Bajo", "gr_nu_statuses=Muy bajo"))
+inspect(b_rules)
+
+#Punto C
+#Followers altos
+c_rules <- arules::subset(rules, subset = items %in% c("gr_nu_seguidores=Alto", "gr_nu_seguidores=Muy alto"))
+c_top_10_bySupport <- sort(c_rules, by = "support", decreasing = TRUE)[1:10]
+inspect(c_top_10_bySupport)
+
+#Punto D
+#Aplicaciones del TP1
+d_rules <- arules::subset(rules, subset = items %in% c("gr_nu_hashtags=Tres", "gr_nu_hashtags=Cuatro"))
